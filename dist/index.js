@@ -14577,6 +14577,19 @@ async function getInfo(submission, session, csrfToken) {
       });
       const submissionDetails = response.data?.data?.submissionDetails;
 
+      if (!submissionDetails) {
+        console.error(
+          "Unexpected LeetCode submissionDetails response:"
+        );
+        console.error(
+          JSON.stringify(response.data, null, 2)
+        );
+
+        throw new Error(
+          `Unable to get submission details for submission #${submission.id}`
+        );
+      }
+
       const runtimePercentile =
         submissionDetails.runtimePercentile !== null &&
         submissionDetails.runtimePercentile !== undefined
@@ -14747,6 +14760,7 @@ async function getQuestionData(titleSlug, leetcodeSession, csrfToken) {
 }
 
 // Returns false if no more submissions should be added.
+// Returns false if no more submissions should be added.
 function addToSubmissions(params) {
   const {
     response,
@@ -14756,19 +14770,52 @@ function addToSubmissions(params) {
     submissions,
   } = params;
 
-  for (const submission of response.data.data.submissionList.submissions) {
+  const submissionList = response.data?.data?.submissionList;
+
+  if (!submissionList) {
+    console.error(
+      "Unexpected LeetCode response: submissionList is missing."
+    );
+    console.error(
+      JSON.stringify(response.data, null, 2)
+    );
+
+    throw new Error(
+      "LeetCode submissionList is missing from the GraphQL response."
+    );
+  }
+
+  if (!Array.isArray(submissionList.submissions)) {
+    console.error(
+      "Unexpected LeetCode response: submissionList.submissions is not an array."
+    );
+    console.error(
+      JSON.stringify(response.data, null, 2)
+    );
+
+    throw new Error(
+      "LeetCode submissionList.submissions is not iterable."
+    );
+  }
+
+  for (const submission of submissionList.submissions) {
     submissionTimestamp = Number(submission.timestamp);
+
     if (submissionTimestamp <= lastTimestamp) {
       return false;
     }
+
     if (submission.statusDisplay !== "Accepted") {
       continue;
     }
+
     const name = normalizeName(submission.title);
     const lang = submission.lang;
+
     if (!submissions_dict[name]) {
       submissions_dict[name] = {};
     }
+
     // Filter out other accepted solutions less than one day from the most recent one.
     if (
       submissions_dict[name][lang] &&
@@ -14776,9 +14823,11 @@ function addToSubmissions(params) {
     ) {
       continue;
     }
+
     submissions_dict[name][lang] = submissionTimestamp;
     submissions.push(submission);
   }
+
   return true;
 }
 
@@ -14901,7 +14950,7 @@ async function sync(inputs) {
     }
 
     offset += 20;
-  } while (response.data.data.submissionList.hasNext);
+  } while (response.data?.data?.submissionList?.hasNext === true);
 
   // We have all submissions we want to write to GitHub now.
   // First, get the default branch to write to.
