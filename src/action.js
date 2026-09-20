@@ -67,26 +67,44 @@ async function getInfo(submission, session, csrfToken) {
   let data = JSON.stringify({
     query: `query submissionDetails($submissionId: Int!) {
       submissionDetails(submissionId: $submissionId) {
+        runtime
+        runtimeDisplay
         runtimePercentile
+        memory
+        memoryDisplay
         memoryPercentile
         code
+        timestamp
+        statusCode
+        statusDisplay
+        lang {
+          name
+          verboseName
+        }
         question {
           questionId
+          title
+          titleSlug
+          content
+          difficulty
         }
       }
     }`,
-    variables: { submissionId: submission.id },
+    variables: { submissionId: Number(submission.id) },
   });
 
   const headers = graphqlHeaders(session, csrfToken);
 
-  // No need to break on first request error since that would be done when getting submissions
-  const getInfo = async (maxRetries = 5, retryCount = 0) => {
+  const getSubmissionInfo = async (maxRetries = 5, retryCount = 0) => {
     try {
-      const response = await axios.post("https://leetcode.com/graphql/", data, {
-        headers,
-      });
-      const submissionDetails = response.data?.data?.submissionDetails;
+      const response = await axios.post(
+        "https://leetcode.com/graphql/",
+        data,
+        { headers }
+      );
+
+      const submissionDetails =
+        response.data?.data?.submissionDetails;
 
       if (!submissionDetails) {
         console.error(
@@ -97,7 +115,7 @@ async function getInfo(submission, session, csrfToken) {
         );
 
         throw new Error(
-          `Unable to get submission details for submission #${submission.id}`
+          `Unable to get details for submission #${submission.id}`
         );
       }
 
@@ -117,34 +135,68 @@ async function getInfo(submission, session, csrfToken) {
         ? pad(submissionDetails.question.questionId.toString())
         : "N/A";
 
+      const lang =
+        submissionDetails?.lang?.name ||
+        submissionDetails?.lang?.verboseName ||
+        submission.lang;
+
       log(`Got info for submission #${submission.id}`);
+
       return {
+        ...submission,
+        title: submissionDetails.question?.title || submission.title,
+        titleSlug:
+          submissionDetails.question?.titleSlug || submission.titleSlug,
+        lang,
+        runtime:
+          submissionDetails.runtime ??
+          submission.runtime ??
+          "N/A",
+        memory:
+          submissionDetails.memory ??
+          submission.memory ??
+          "N/A",
+        statusDisplay:
+          submissionDetails.statusDisplay ||
+          submission.statusDisplay ||
+          "Accepted",
+        timestamp:
+          submissionDetails.timestamp ||
+          submission.timestamp,
         runtimePerc: runtimePercentile,
         memoryPerc: memoryPercentile,
         qid: questionId,
-        code: response.data.data.submissionDetails.code,
+        code: submissionDetails.code,
       };
     } catch (exception) {
       if (retryCount >= maxRetries) {
-        // If problem is locked due to user not having LeetCode Premium
-        if (exception.response && exception.response.status === 403) {
+        if (
+          exception.response &&
+          exception.response.status === 403
+        ) {
           log(`Skipping locked problem: ${submission.title}`);
           return null;
         }
+
         throw exception;
       }
+
       log(
         "Error fetching submission info, retrying in " +
           3 ** retryCount +
           " seconds..."
       );
+
       await delay(3 ** retryCount * 1000);
-      return getInfo(maxRetries, retryCount + 1);
+
+      return getSubmissionInfo(
+        maxRetries,
+        retryCount + 1
+      );
     }
   };
 
-  info = await getInfo();
-  return { ...submission, ...info };
+  return await getSubmissionInfo();
 }
 
 async function commit(params) {
@@ -272,6 +324,7 @@ async function getQuestionData(titleSlug, leetcodeSession, csrfToken) {
 
 // Returns false if no more submissions should be added.
 // Returns false if no more submissions should be added.
+// Adds accepted submissions to the sync list.
 function addToSubmissions(params) {
   const {
     response,
@@ -281,65 +334,261 @@ function addToSubmissions(params) {
     submissions,
   } = params;
 
-  const submissionList = response.data?.data?.submissionList;
+  const recentSubmissions =
+    response.data?.data?.recentAcSubmissionList;
 
-  if (!submissionList) {
+  if (!Array.isArray(recentSubmissions)) {
     console.error(
-      "Unexpected LeetCode response: submissionList is missing."
-    );
-    console.error(
-      JSON.stringify(response.data, null, 2)
+      "Unexpected LeetCode response: recentAcSubmissionList is not an array."
     );
 
-    throw new Error(
-      "LeetCode submissionList is missing from the GraphQL response."
-    );
-  }
-
-  if (!Array.isArray(submissionList.submissions)) {
-    console.error(
-      "Unexpected LeetCode response: submissionList.submissions is not an array."
-    );
     console.error(
       JSON.stringify(response.data, null, 2)
     );
 
     throw new Error(
-      "LeetCode submissionList.submissions is not iterable."
+      "LeetCode recentAcSubmissionList is not available."
     );
   }
 
-  for (const submission of submissionList.submissions) {
-    submissionTimestamp = Number(submission.timestamp);
+  for (const submission of recentSubmissions) {
+    const submissionTimestamp =
+      Number(submission.timestamp);
 
     if (submissionTimestamp <= lastTimestamp) {
-      return false;
-    }
-
-    if (submission.statusDisplay !== "Accepted") {
       continue;
     }
 
     const name = normalizeName(submission.title);
-    const lang = submission.lang;
+
+    // recentAcSubmissionList already contains only
+    // accepted submissions.
+    const lang = submission.lang || "unknown";
 
     if (!submissions_dict[name]) {
       submissions_dict[name] = {};
     }
 
-    // Filter out other accepted solutions less than one day from the most recent one.
     if (
       submissions_dict[name][lang] &&
-      submissions_dict[name][lang] - submissionTimestamp < filterDuplicateSecs
+      submissions_dict[name][lang] - submissionTimestamp <
+        filterDuplicateSecs
     ) {
       continue;
     }
 
-    submissions_dict[name][lang] = submissionTimestamp;
-    submissions.push(submission);
+    submissions_dict[name][lang] =
+      submissionTimestamp;
+
+    submissions.push({
+      ...submission,
+      statusDisplay: "Accepted",
+    });
   }
 
   return true;
+}
+
+async function getLeetCodeUsername(
+  leetcodeSession,
+  csrfToken
+) {
+  const headers = graphqlHeaders(
+    leetcodeSession,
+    csrfToken
+  );
+
+  const graphql = JSON.stringify({
+    query: `query {
+      userStatus {
+        isSignedIn
+        username
+      }
+    }`,
+  });
+
+  const response = await axios.post(
+    "https://leetcode.com/graphql/",
+    graphql,
+    { headers }
+  );
+
+  const userStatus =
+    response.data?.data?.userStatus;
+
+  if (!userStatus?.isSignedIn || !userStatus?.username) {
+    throw new Error(
+      "Unable to determine LeetCode username. Your LEETCODE_SESSION may be expired."
+    );
+  }
+
+  log(
+    `Authenticated as LeetCode user: ${userStatus.username}`
+  );
+
+  return userStatus.username;
+}
+
+async function getRecentAcceptedSubmissions(
+  username,
+  leetcodeSession,
+  csrfToken
+) {
+  const headers = graphqlHeaders(
+    leetcodeSession,
+    csrfToken
+  );
+
+  const graphql = JSON.stringify({
+    query: `query recentAcSubmissions(
+      $username: String!,
+      $limit: Int!
+    ) {
+      recentAcSubmissionList(
+        username: $username,
+        limit: $limit
+      ) {
+        id
+        title
+        titleSlug
+        timestamp
+      }
+    }`,
+    variables: {
+      username,
+      limit: 20,
+    },
+  });
+
+  const response = await axios.post(
+    "https://leetcode.com/graphql/",
+    graphql,
+    { headers }
+  );
+
+  const submissions =
+    response.data?.data?.recentAcSubmissionList;
+
+  if (!Array.isArray(submissions)) {
+    console.error(
+      "Unexpected recentAcSubmissionList response:"
+    );
+
+    console.error(
+      JSON.stringify(response.data, null, 2)
+    );
+
+    throw new Error(
+      "LeetCode recentAcSubmissionList did not return an array."
+    );
+  }
+
+  log(
+    `Found ${submissions.length} recent accepted submissions.`
+  );
+
+  return response;
+}
+
+async function getLeetCodeUsername(
+  leetcodeSession,
+  csrfToken
+) {
+  const headers = graphqlHeaders(
+    leetcodeSession,
+    csrfToken
+  );
+
+  const graphql = JSON.stringify({
+    query: `query {
+      userStatus {
+        isSignedIn
+        username
+      }
+    }`,
+  });
+
+  const response = await axios.post(
+    "https://leetcode.com/graphql/",
+    graphql,
+    { headers }
+  );
+
+  const userStatus =
+    response.data?.data?.userStatus;
+
+  if (!userStatus?.isSignedIn || !userStatus?.username) {
+    throw new Error(
+      "Unable to determine LeetCode username. Your LEETCODE_SESSION may be expired."
+    );
+  }
+
+  log(
+    `Authenticated as LeetCode user: ${userStatus.username}`
+  );
+
+  return userStatus.username;
+}
+
+async function getRecentAcceptedSubmissions(
+  username,
+  leetcodeSession,
+  csrfToken
+) {
+  const headers = graphqlHeaders(
+    leetcodeSession,
+    csrfToken
+  );
+
+  const graphql = JSON.stringify({
+    query: `query recentAcSubmissions(
+      $username: String!,
+      $limit: Int!
+    ) {
+      recentAcSubmissionList(
+        username: $username,
+        limit: $limit
+      ) {
+        id
+        title
+        titleSlug
+        timestamp
+      }
+    }`,
+    variables: {
+      username,
+      limit: 20,
+    },
+  });
+
+  const response = await axios.post(
+    "https://leetcode.com/graphql/",
+    graphql,
+    { headers }
+  );
+
+  const submissions =
+    response.data?.data?.recentAcSubmissionList;
+
+  if (!Array.isArray(submissions)) {
+    console.error(
+      "Unexpected recentAcSubmissionList response:"
+    );
+
+    console.error(
+      JSON.stringify(response.data, null, 2)
+    );
+
+    throw new Error(
+      "LeetCode recentAcSubmissionList did not return an array."
+    );
+  }
+
+  log(
+    `Found ${submissions.length} recent accepted submissions.`
+  );
+
+  return response;
 }
 
 async function sync(inputs) {
@@ -385,84 +634,32 @@ async function sync(inputs) {
   }
 
   // Get all Accepted submissions from LeetCode greater than the timestamp.
-  let response = null;
-  let offset = 0;
-  const submissions = [];
-  const submissions_dict = {};
-  do {
-    log(`Getting submission from LeetCode, offset ${offset}`);
+  // Get recent Accepted submissions from LeetCode.
+const submissions = [];
+const submissions_dict = {};
 
-    const getSubmissions = async (maxRetries, retryCount = 0) => {
-      try {
-        const slug = undefined;
-        const graphql = JSON.stringify({
-          query: `query ($offset: Int!, $limit: Int!, $slug: String) {
-              submissionList(offset: $offset, limit: $limit, questionSlug: $slug) {
-                  hasNext
-                  submissions {
-                      id
-                      lang
-                      timestamp
-                      statusDisplay
-                      runtime
-                      title
-                      memory
-                      titleSlug
-                  }
-              }
-          }`,
-          variables: {
-            offset: offset,
-            limit: 20,
-            slug,
-          },
-        });
+log("Getting LeetCode username...");
 
-        const headers = graphqlHeaders(leetcodeSession, leetcodeCSRFToken);
-        const response = await axios.post(
-          "https://leetcode.com/graphql/",
-          graphql,
-          { headers }
-        );
-        log(`Successfully fetched submission from LeetCode, offset ${offset}`);
-        return response;
-      } catch (exception) {
-        if (retryCount >= maxRetries) {
-          throw exception;
-        }
-        log(
-          "Error fetching submissions, retrying in " +
-            3 ** retryCount +
-            " seconds..."
-        );
-        // There's a rate limit on LeetCode API, so wait with backoff before retrying.
-        await delay(3 ** retryCount * 1000);
-        return getSubmissions(maxRetries, retryCount + 1);
-      }
-    };
-    // On the first attempt, there should be no rate limiting issues, so we fail immediately in case
-    // the tokens are configured incorrectly.
-    const maxRetries = response === null ? 0 : 5;
-    if (response !== null) {
-      // Add a 1 second delay before all requests after the initial request.
-      await delay(1000);
-    }
-    response = await getSubmissions(maxRetries);
-    if (
-      !addToSubmissions({
-        response,
-        lastTimestamp,
-        filterDuplicateSecs,
-        submissions_dict,
-        submissions,
-      })
-    ) {
-      break;
-    }
+const username = await getLeetCodeUsername(
+  leetcodeSession,
+  leetcodeCSRFToken
+);
 
-    offset += 20;
-  } while (response.data?.data?.submissionList?.hasNext === true);
+log(`Getting recent accepted submissions for ${username}...`);
 
+const response = await getRecentAcceptedSubmissions(
+  username,
+  leetcodeSession,
+  leetcodeCSRFToken
+);
+
+addToSubmissions({
+  response,
+  lastTimestamp,
+  filterDuplicateSecs,
+  submissions_dict,
+  submissions,
+});
   // We have all submissions we want to write to GitHub now.
   // First, get the default branch to write to.
   const repoInfo = await octokit.repos.get({
